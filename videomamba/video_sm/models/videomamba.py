@@ -26,7 +26,7 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
-MODEL_PATH = 'your_model_path'
+MODEL_PATH = "your_model_path"
 _MODELS = {
     "videomamba_t16_in1k": os.path.join(MODEL_PATH, "videomamba_t16_in1k_res224.pth"),
     "videomamba_s16_in1k": os.path.join(MODEL_PATH, "videomamba_s16_in1k_res224.pth"),
@@ -36,7 +36,13 @@ _MODELS = {
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False,drop_path=0.,
+        self,
+        dim,
+        mixer_cls,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        drop_path=0.0,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -55,7 +61,7 @@ class Block(nn.Module):
         self.fused_add_norm = fused_add_norm
         self.mixer = mixer_cls(dim)
         self.norm = norm_cls(dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
@@ -63,8 +69,11 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None,
-        use_checkpoint=False
+        self,
+        hidden_states: Tensor,
+        residual: Optional[Tensor] = None,
+        inference_params=None,
+        use_checkpoint=False,
     ):
         r"""Pass the input through the encoder layer.
 
@@ -73,12 +82,18 @@ class Block(nn.Module):
             residual: hidden_states = Mixer(LN(residual))
         """
         if not self.fused_add_norm:
-            residual = (residual + self.drop_path(hidden_states)) if residual is not None else hidden_states
+            residual = (
+                (residual + self.drop_path(hidden_states))
+                if residual is not None
+                else hidden_states
+            )
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
-            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            fused_add_norm_fn = (
+                rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            )
             hidden_states, residual = fused_add_norm_fn(
                 hidden_states if residual is None else self.drop_path(hidden_states),
                 self.norm.weight,
@@ -89,20 +104,24 @@ class Block(nn.Module):
                 eps=self.norm.eps,
             )
         if use_checkpoint:
-            hidden_states = checkpoint.checkpoint(self.mixer, hidden_states, inference_params)
+            hidden_states = checkpoint.checkpoint(
+                self.mixer, hidden_states, inference_params
+            )
         else:
             hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.mixer.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
 
 
 def create_block(
     d_model,
     ssm_cfg=None,
     norm_epsilon=1e-5,
-    drop_path=0.,
+    drop_path=0.0,
     rms_norm=True,
     residual_in_fp32=True,
     fused_add_norm=True,
@@ -114,7 +133,9 @@ def create_block(
     factory_kwargs = {"device": device, "dtype": dtype}
     if ssm_cfg is None:
         ssm_cfg = {}
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs)
+    mixer_cls = partial(
+        Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs
+    )
     norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon)
     block = Block(
         d_model,
@@ -172,9 +193,11 @@ def segm_init_weights(m):
 
 
 class PatchEmbed(nn.Module):
-    """ Image to Patch Embedding
-    """
-    def __init__(self, img_size=224, patch_size=16, kernel_size=1, in_chans=3, embed_dim=768):
+    """Image to Patch Embedding"""
+
+    def __init__(
+        self, img_size=224, patch_size=16, kernel_size=1, in_chans=3, embed_dim=768
+    ):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -185,75 +208,90 @@ class PatchEmbed(nn.Module):
         self.tubelet_size = kernel_size
 
         self.proj = nn.Conv3d(
-            in_chans, embed_dim, 
+            in_chans,
+            embed_dim,
             kernel_size=(kernel_size, patch_size[0], patch_size[1]),
-            stride=(kernel_size, patch_size[0], patch_size[1])
+            stride=(kernel_size, patch_size[0], patch_size[1]),
         )
 
     def forward(self, x):
         x = self.proj(x)
         return x
-    
+
 
 class VisionMamba(nn.Module):
     def __init__(
-            self, 
-            img_size=224, 
-            patch_size=16, 
-            depth=24, 
-            embed_dim=192, 
-            channels=3, 
-            num_classes=1000,
-            drop_rate=0.,
-            drop_path_rate=0.1,
-            ssm_cfg=None, 
-            norm_epsilon=1e-5, 
-            initializer_cfg=None,
-            fused_add_norm=True,
-            rms_norm=True, 
-            residual_in_fp32=True,
-            bimamba=True,
-            # video
-            kernel_size=1, 
-            num_frames=8, 
-            fc_drop_rate=0., 
-            device=None,
-            dtype=None,
-            # checkpoint
-            use_checkpoint=False,
-            checkpoint_num=0,
-        ):
-        factory_kwargs = {"device": device, "dtype": dtype} # follow MambaLMHeadModel
+        self,
+        img_size=224,
+        patch_size=16,
+        depth=24,
+        embed_dim=192,
+        channels=3,
+        num_classes=1000,
+        drop_rate=0.0,
+        drop_path_rate=0.1,
+        ssm_cfg=None,
+        norm_epsilon=1e-5,
+        initializer_cfg=None,
+        fused_add_norm=True,
+        rms_norm=True,
+        residual_in_fp32=True,
+        bimamba=True,
+        # video
+        kernel_size=1,
+        num_frames=8,
+        fc_drop_rate=0.0,
+        device=None,
+        dtype=None,
+        # checkpoint
+        use_checkpoint=False,
+        checkpoint_num=0,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}  # follow MambaLMHeadModel
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
-        print(f'Use checkpoint: {use_checkpoint}')
-        print(f'Checkpoint number: {checkpoint_num}')
+        print(f"Use checkpoint: {use_checkpoint}")
+        print(f"Checkpoint number: {checkpoint_num}")
 
         # pretrain parameters
         self.num_classes = num_classes
-        self.d_model = self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.d_model = self.num_features = self.embed_dim = (
+            embed_dim  # num_features for consistency with other models
+        )
 
         self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, 
+            img_size=img_size,
+            patch_size=patch_size,
             kernel_size=kernel_size,
-            in_chans=channels, embed_dim=embed_dim
+            in_chans=channels,
+            embed_dim=embed_dim,
         )
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.embed_dim))
-        self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, num_frames // kernel_size, embed_dim))
+        self.temporal_pos_embedding = nn.Parameter(
+            torch.zeros(1, num_frames // kernel_size, embed_dim)
+        )
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.head_drop = nn.Dropout(fc_drop_rate) if fc_drop_rate > 0 else nn.Identity()
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = (
+            nn.Linear(self.num_features, num_classes)
+            if num_classes > 0
+            else nn.Identity()
+        )
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [
+            x.item() for x in torch.linspace(0, drop_path_rate, depth)
+        ]  # stochastic depth decay rule
         inter_dpr = [0.0] + dpr
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.drop_path = (
+            DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        )
         # mamba blocks
         self.layers = nn.ModuleList(
             [
@@ -272,14 +310,16 @@ class VisionMamba(nn.Module):
                 for i in range(depth)
             ]
         )
-        
+
         # output head
-        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(embed_dim, eps=norm_epsilon, **factory_kwargs)
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
+            embed_dim, eps=norm_epsilon, **factory_kwargs
+        )
 
         # original init
         self.apply(segm_init_weights)
         self.head.apply(segm_init_weights)
-        trunc_normal_(self.pos_embed, std=.02)
+        trunc_normal_(self.pos_embed, std=0.02)
 
         # mamba init
         self.apply(
@@ -292,14 +332,16 @@ class VisionMamba(nn.Module):
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+            i: layer.allocate_inference_cache(
+                batch_size, max_seqlen, dtype=dtype, **kwargs
+            )
             for i, layer in enumerate(self.layers)
         }
 
     @torch.jit.ignore
     def no_weight_decay(self):
         return {"pos_embed", "cls_token", "temporal_pos_embedding"}
-    
+
     def get_num_layers(self):
         return len(self.layers)
 
@@ -312,16 +354,18 @@ class VisionMamba(nn.Module):
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
 
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        cls_token = self.cls_token.expand(
+            x.shape[0], -1, -1
+        )  # stole cls_tokens impl from Phil Wang, thanks
         x = torch.cat((cls_token, x), dim=1)
         x = x + self.pos_embed
 
         # temporal pos
         cls_tokens = x[:B, :1, :]
         x = x[:, 1:]
-        x = rearrange(x, '(b t) n m -> (b n) t m', b=B, t=T)
+        x = rearrange(x, "(b t) n m -> (b n) t m", b=B, t=T)
         x = x + self.temporal_pos_embedding
-        x = rearrange(x, '(b n) t m -> b (t n) m', b=B, t=T)
+        x = rearrange(x, "(b n) t m -> b (t n) m", b=B, t=T)
         x = torch.cat((cls_tokens, x), dim=1)
 
         x = self.pos_drop(x)
@@ -332,8 +376,10 @@ class VisionMamba(nn.Module):
         for idx, layer in enumerate(self.layers):
             if self.use_checkpoint and idx < self.checkpoint_num:
                 hidden_states, residual = layer(
-                    hidden_states, residual, inference_params=inference_params,
-                    use_checkpoint=True
+                    hidden_states,
+                    residual,
+                    inference_params=inference_params,
+                    use_checkpoint=True,
                 )
             else:
                 hidden_states, residual = layer(
@@ -348,7 +394,9 @@ class VisionMamba(nn.Module):
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             # Set prenorm=False here since we don't need the residual
-            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
+            fused_add_norm_fn = (
+                rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
+            )
             hidden_states = fused_add_norm_fn(
                 self.drop_path(hidden_states),
                 self.norm_f.weight,
@@ -369,7 +417,7 @@ class VisionMamba(nn.Module):
 
 
 def inflate_weight(weight_2d, time_dim, center=True):
-    print(f'Init center: {center}')
+    print(f"Init center: {center}")
     if center:
         weight_3d = torch.zeros(*weight_2d.shape)
         weight_3d = weight_3d.unsqueeze(2).repeat(1, 1, time_dim, 1, 1)
@@ -386,76 +434,76 @@ def load_state_dict(model, state_dict, center=True):
     for k in state_dict.keys():
         if k in state_dict_3d.keys() and state_dict[k].shape != state_dict_3d[k].shape:
             if len(state_dict_3d[k].shape) <= 3:
-                print(f'Ignore: {k}')
+                print(f"Ignore: {k}")
                 continue
-            print(f'Inflate: {k}, {state_dict[k].shape} => {state_dict_3d[k].shape}')
+            print(f"Inflate: {k}, {state_dict[k].shape} => {state_dict_3d[k].shape}")
             time_dim = state_dict_3d[k].shape[2]
             state_dict[k] = inflate_weight(state_dict[k], time_dim, center=center)
-    
-    del state_dict['head.weight']
-    del state_dict['head.bias']
+
+    del state_dict["head.weight"]
+    del state_dict["head.bias"]
     msg = model.load_state_dict(state_dict, strict=False)
     print(msg)
 
 
 @register_model
-def videomamba_tiny(pretrained=False, **kwargs):
+def videomamba_tiny(config, **kwargs):
     model = VisionMamba(
-        patch_size=16, 
-        embed_dim=192, 
-        depth=24, 
-        rms_norm=True, 
-        residual_in_fp32=True, 
-        fused_add_norm=True, 
-        **kwargs
+        patch_size=16,
+        embed_dim=192,
+        depth=24,
+        rms_norm=True,
+        residual_in_fp32=True,
+        fused_add_norm=True,
+        **kwargs,
     )
     model.default_cfg = _cfg()
-    if pretrained:
-        print('load pretrained weights')
-        state_dict = torch.load(_MODELS["videomamba_t16_in1k"], map_location='cpu')
+    if config.pretrained:
+        print("load pretrained weights")
+        state_dict = torch.load(config.pretrained_path, map_location="cpu")
         load_state_dict(model, state_dict, center=True)
     return model
 
 
 @register_model
-def videomamba_small(pretrained=False, **kwargs):
+def videomamba_small(config, **kwargs):
     model = VisionMamba(
-        patch_size=16, 
-        embed_dim=384, 
-        depth=24, 
-        rms_norm=True, 
-        residual_in_fp32=True, 
-        fused_add_norm=True, 
-        **kwargs
+        patch_size=16,
+        embed_dim=384,
+        depth=24,
+        rms_norm=True,
+        residual_in_fp32=True,
+        fused_add_norm=True,
+        **kwargs,
     )
     model.default_cfg = _cfg()
-    if pretrained:
-        print('load pretrained weights')
-        state_dict = torch.load(_MODELS["videomamba_s16_in1k"], map_location='cpu')
+    if config.pretrained:
+        print("load pretrained weights")
+        state_dict = torch.load(config.pretrained_path, map_location="cpu")
         load_state_dict(model, state_dict, center=True)
     return model
 
 
 @register_model
-def videomamba_middle(pretrained=False, **kwargs):
+def videomamba_middle(config, **kwargs):
     model = VisionMamba(
-        patch_size=16, 
-        embed_dim=576, 
-        depth=32, 
-        rms_norm=True, 
-        residual_in_fp32=True, 
-        fused_add_norm=True, 
-        **kwargs
+        patch_size=16,
+        embed_dim=576,
+        depth=32,
+        rms_norm=True,
+        residual_in_fp32=True,
+        fused_add_norm=True,
+        **kwargs,
     )
     model.default_cfg = _cfg()
-    if pretrained:
-        print('load pretrained weights')
-        state_dict = torch.load(_MODELS["videomamba_m16_in1k"], map_location='cpu')
+    if config.pretrained:
+        print("load pretrained weights")
+        state_dict = torch.load(config.pretrained_path, map_location="cpu")
         load_state_dict(model, state_dict, center=True)
     return model
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import time
     from fvcore.nn import FlopCountAnalysis
     from fvcore.nn import flop_count_table
@@ -471,7 +519,9 @@ if __name__ == '__main__':
 
     # To evaluate GFLOPs, pleaset set `rms_norm=False` and `fused_add_norm=False`
     model = videomamba_middle(num_frames=num_frames).cuda()
-    flops = FlopCountAnalysis(model, torch.rand(1, 3, num_frames, img_size, img_size).cuda())
+    flops = FlopCountAnalysis(
+        model, torch.rand(1, 3, num_frames, img_size, img_size).cuda()
+    )
     s = time.time()
     print(flop_count_table(flops, max_depth=1))
-    print(time.time()-s)
+    print(time.time() - s)
